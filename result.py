@@ -526,8 +526,8 @@ def run_full_workflow_gradio(rate_card_file, etof_file, mismatch_report_files=No
 
 
 # ---- Gradio UI definition ----
-with gr.Blocks(title="CANF Analyzer", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 📊 CANF Analyzer")
+with gr.Blocks(title="Mismatch Analyzer", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 📊 Mismatch Analyzer")
     gr.Markdown("### Process and match shipment data with rate card lanes")
     
     with gr.Accordion("📖 Instructions & Information", open=False):
@@ -585,7 +585,7 @@ with gr.Blocks(title="CANF Analyzer", theme=gr.themes.Soft()) as demo:
     
     with gr.Row():
         rate_card_input = gr.File(
-            label="Rate Card file(s) (.xlsx) *Required — one JSON + accessorial JSON per file",
+            label="Rate Card file(s) (.xlsx) *Required",
             file_types=[".xlsx", ".xls"],
             file_count="multiple",
         )
