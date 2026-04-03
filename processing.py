@@ -623,6 +623,19 @@ def _rate_by_is_volume_cbm(rate_by: str) -> bool:
     return "volume" in rb and "cbm" in rb
 
 
+def _rate_by_is_cost_measurement_token(rate_by: str) -> bool:
+    """``Cost/CBS``, ``Cost/CON``, …: unit count comes from the matching MEASUREMENT segment."""
+    rb = _normalize_rate_by_string(rate_by).lower()
+    return rb.startswith("cost/")
+
+
+def _units_for_measurement_token_rate_by(
+    row: dict[str, Any], rate_by: str
+) -> Optional[float]:
+    """UNITS_MEASUREMENT segment aligned with ``Rate_by`` (same pairing as ``Container/…``)."""
+    return _units_for_container_rate_by(row, rate_by)
+
+
 def _measurement_segments_normalized(row: dict[str, Any]) -> list[str]:
     """Semicolon-separated MEASUREMENT tokens (normalized slashes)."""
     m = row.get("MEASUREMENT") or row.get("Measurement") or ""
@@ -1303,6 +1316,7 @@ def compute_rate_cost_calculated(
     Weight/kg: same tier rules but × WEIGHT_ETOF.
     Quantity/Container: p/unit → Rate cost × sum of units for MEASUREMENT segments containing ``Container``.
     Volume/cbm: p/unit → Rate cost × CBM (after ``Rounding_rule`` for CBM when present).
+    Cost/CBS, Cost/CON, …: p/unit → Rate cost × UNITS_MEASUREMENT segment for that ``Cost/…`` token.
     """
     if rate_cost is None:
         return None
@@ -1333,6 +1347,13 @@ def compute_rate_cost_calculated(
                 return None
             v_eff = apply_rounding_for_cbm(v, rounding_rule)
             return rc * v_eff
+        return None
+    if _rate_by_is_cost_measurement_token(rb):
+        if _measurement_is_p_unit(cost_tier_measurement):
+            u = _units_for_measurement_token_rate_by(row, rb)
+            if u is None:
+                return None
+            return rc * float(u)
         return None
     return None
 
@@ -1417,6 +1438,17 @@ def format_rate_cost_comment(
             f"{price_s} (p/unit, rate) = {result_s}."
         )
 
+    if _rate_by_is_cost_measurement_token(rb) and _measurement_is_p_unit(cost_tier_measurement):
+        u = _units_for_measurement_token_rate_by(row, rb)
+        if u is None:
+            return ""
+        u_s = _format_number_for_rate_comment(float(u))
+        tok = _normalize_rate_by_string(rate_by).strip() or rb
+        return (
+            f"Calculated according to the rate card. {u_s} ({tok}) × "
+            f"{price_s} (p/unit, rate) = {result_s}."
+        )
+
     return ""
 
 
@@ -1462,6 +1494,11 @@ def compute_rate_cost_file(
         if abs(v_eff) < 1e-12:
             return None
         base = pc / v_eff
+    elif _rate_by_is_cost_measurement_token(rb) and _measurement_is_p_unit(cost_tier_measurement):
+        u = _units_for_measurement_token_rate_by(row, rb)
+        if u is None or abs(u) < 1e-12:
+            return None
+        base = pc / float(u)
     if base is None:
         return None
     return _divide_by_exchange_rate(base, row)
@@ -1505,6 +1542,11 @@ def compute_carrier_rate_file(
         if abs(v_eff) < 1e-12:
             return None
         base = inv / v_eff
+    elif _rate_by_is_cost_measurement_token(rb) and _measurement_is_p_unit(cost_tier_measurement):
+        u = _units_for_measurement_token_rate_by(row, rb)
+        if u is None or abs(u) < 1e-12:
+            return None
+        base = inv / float(u)
     if base is None:
         return None
     return _divide_by_exchange_rate(base, row)
@@ -2507,6 +2549,21 @@ def compute_lane_rate_cost_and_tier(
     if _rate_by_is_quantity_container(rb):
         q = quantity_container_units_from_row(row)
         if q is None or abs(q) < 1e-12:
+            return None, None
+        for c in costs_use:
+            if _measurement_is_p_unit(c.get("Measurement")):
+                p = c.get("Price")
+                if p is None or (isinstance(p, float) and pd.isna(p)):
+                    continue
+                try:
+                    return float(p), c
+                except (TypeError, ValueError):
+                    return None, None
+        return None, None
+
+    if _rate_by_is_cost_measurement_token(rb):
+        u = _units_for_measurement_token_rate_by(row, rb)
+        if u is None:
             return None, None
         for c in costs_use:
             if _measurement_is_p_unit(c.get("Measurement")):
