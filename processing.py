@@ -133,6 +133,24 @@ def _accessorial_json_path(partly_df: str, ra_id: str) -> str:
     return os.path.join(partly_df, f"accessorial_costs_{ra_id}.json")
 
 
+def _cost_def_matches_row_cost_type(row_cost_type: str, definition: dict[str, Any]) -> bool:
+    """
+    Match mismatch ``Cost type`` to a ``cost_definitions`` row.
+
+    Seasonal rows (e.g. Fuel Surcharge) sometimes have empty ``Cost_type``; the label
+    then appears only in ``Applies_if`` (``Fuel Surcharge (May 2025)``).
+    """
+    if _cost_type_matches_row_to_card(row_cost_type, definition.get("Cost_type")):
+        return True
+    r = _norm(row_cost_type)
+    if not r or _norm(definition.get("Cost_type")):
+        return False
+    ai = _norm(definition.get("Applies_if") or "")
+    if not ai:
+        return False
+    return ai == r or ai.startswith(r + " (")
+
+
 def _cost_type_matches_row_to_card(row_cost_type: str, card_cost_type: Any) -> bool:
     """
     True if mismatch ``Cost type`` matches a rate-card definition or lane ``Cost Type`` string.
@@ -176,15 +194,11 @@ def _cost_defs_from_filtered(
     defs = filtered.get("cost_definitions") or []
     ct = _norm(cost_type)
     exact = [d for d in defs if _norm(d.get("Cost_type")) == ct]
-    candidates = exact if exact else [d for d in defs if _cost_type_matches_row_to_card(ct, d.get("Cost_type"))]
+    candidates = exact if exact else [d for d in defs if _cost_def_matches_row_cost_type(ct, d)]
     if row is None:
         return candidates
     allowed = [d for d in candidates if applies_if_allows(d.get("Applies_if") or "", row)]
-    allowed = [
-        d
-        for d in allowed
-        if _applies_if_validity_period_contains_shipment(d.get("Applies_if") or "", row)
-    ]
+    allowed = [d for d in allowed if _definition_validity_period_contains_shipment(d, row)]
     if row is not None and _norm(cost_type).lower() == "transport cost":
         grouped = [
             d
@@ -206,36 +220,149 @@ def _row_ship_date_as_date(row: dict[str, Any]) -> Any:
     return _parse_date_for_validity(s)
 
 
-def _applies_if_validity_period_contains_shipment(
-    applies_if: str, row: dict[str, Any]
-) -> bool:
+def _text_validity_period_contains_shipment_date(text: str, row: dict[str, Any]) -> bool:
     """
-    False when ``Applies_if`` embeds a ``Validity period: to …`` / ``from …`` line that
-    excludes :func:`_row_ship_date_as_date` (e.g. two Consolidated rows with different windows).
+    Shipment date must fall inside any ``Validity period`` window in *text*.
+
+    Handles ``from DD.MM.YYYY to DD.MM.YYYY`` (Fuel Surcharge often stores this in ``Rate_by``),
+    ``Validity period: to …`` (open start), and legacy ``from``-only lower bounds.
     """
     ship = _row_ship_date_as_date(row)
     if ship is None:
         return True
-    text = str(applies_if or "").replace("\r\n", "\n")
-    if not text.strip():
+    blob = str(text or "").replace("\r\n", "\n")
+    if not blob.strip():
         return True
-    m_to = re.search(
-        r"(?i)validity\s+period\s*:\s*to\s*(\d{1,2}\.\d{1,2}\.\d{4})",
-        text,
+    mrng = re.search(
+        r"(?i)validity\s+period\s*:\s*from\s*(\d{1,2}\.\d{1,2}\.\d{4})\s*to\s*(\d{1,2}\.\d{1,2}\.\d{4})",
+        blob,
     )
-    if m_to:
-        end = _parse_date_for_validity(m_to.group(1))
-        if end is not None and ship > end:
+    if mrng:
+        df = _parse_date_for_validity(mrng.group(1))
+        dt = _parse_date_for_validity(mrng.group(2))
+        if df is not None and ship < df:
             return False
+        if dt is not None and ship > dt:
+            return False
+        return True
+    if not re.search(
+        r"(?i)validity\s+period\s*:\s*from\s*\d{1,2}\.\d{1,2}\.\d{4}\s+to",
+        blob,
+    ):
+        m_to = re.search(
+            r"(?i)validity\s+period\s*:\s*to\s*(\d{1,2}\.\d{1,2}\.\d{4})",
+            blob,
+        )
+        if m_to:
+            end = _parse_date_for_validity(m_to.group(1))
+            if end is not None and ship > end:
+                return False
+            return True
     m_from = re.search(
         r"(?i)validity\s+period\s*:\s*from\s*(\d{1,2}\.\d{1,2}\.\d{4})",
-        text,
+        blob,
     )
     if m_from:
         start = _parse_date_for_validity(m_from.group(1))
         if start is not None and ship < start:
             return False
     return True
+
+
+def _definition_validity_period_contains_shipment(
+    definition: dict[str, Any], row: dict[str, Any]
+) -> bool:
+    """Merge ``Applies_if``, ``Rate_by``, and ``Rule`` so Fuel Surcharge windows in ``Rate_by`` apply."""
+    parts = [
+        definition.get("Applies_if"),
+        definition.get("Rate_by"),
+        definition.get("Rule"),
+    ]
+    blob = "\n".join(str(p).replace("\r\n", "\n") for p in parts if p is not None and str(p).strip())
+    return _text_validity_period_contains_shipment_date(blob, row)
+
+
+def _is_fuel_surcharge_cost_definition(d: dict[str, Any]) -> bool:
+    """
+    True for Fuel Surcharge monthly rows — either repaired (:func:`sanitize_filtered_rate_card_json_object`
+    Case D: ``Cost_type`` ``Fuel Surcharge (…)``) or legacy (empty ``Cost_type``, title in ``Applies_if``).
+    """
+    ct = _norm(d.get("Cost_type") or "").lower()
+    if ct.startswith("fuel surcharge ("):
+        return True
+    if _norm(d.get("Cost_type")):
+        return False
+    ai = _norm(d.get("Applies_if") or "")
+    return bool(ai) and ai.lower().startswith("fuel surcharge")
+
+
+def _fuel_surcharge_definitions_ordered(cost_definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [d for d in cost_definitions if isinstance(d, dict) and _is_fuel_surcharge_cost_definition(d)]
+
+
+def _lane_fuel_surcharge_first_empty_run_indices(costs: list[dict[str, Any]]) -> list[int]:
+    """Lane JSON lists Fuel Surcharge tiers as consecutive rows with empty ``Cost Type``."""
+    out: list[int] = []
+    for i, c in enumerate(costs):
+        if not _norm(c.get("Cost Type")):
+            out.append(i)
+        elif out:
+            break
+    return out
+
+
+def _fuel_surcharge_lane_cost_rows_for_def(
+    lane_costs: list[dict[str, Any]],
+    all_cost_definitions: list[dict[str, Any]],
+    selected: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ordered = _fuel_surcharge_definitions_ordered(all_cost_definitions)
+    try:
+        idx = ordered.index(selected)
+    except ValueError:
+        return []
+    slot_indices = _lane_fuel_surcharge_first_empty_run_indices(lane_costs)
+    if idx < 0 or idx >= len(slot_indices):
+        return []
+    return [lane_costs[slot_indices[idx]]]
+
+
+def _effective_rate_by_from_merged_card_row(d: dict[str, Any]) -> str:
+    """
+    When ``Rate_by`` holds a validity sentence (Fuel Surcharge exports), read
+    ``Weight/chargeable kg`` from ``Rounding_rule`` (``Rate by: …; Regular rule``).
+    """
+    rb = _norm(d.get("Rate_by") or "")
+    if rb and "validity period" not in rb.lower():
+        return rb
+    rr = _norm(d.get("Rounding_rule") or "")
+    m = re.search(r"(?i)rate\s*by\s*:\s*([^;]+)", rr)
+    if m:
+        return m.group(1).strip()
+    return rb
+
+
+def _fuel_surcharge_rounding_rule_for_calc(d: dict[str, Any]) -> str:
+    """Second segment of ``Rounding_rule`` after ``;`` (e.g. ``Regular rule``). After Case D repair, ``Rule`` holds ``Regular rule``."""
+    rr = _norm(d.get("Rounding_rule") or "")
+    if ";" in rr:
+        tail = rr.split(";", 1)[1].strip()
+        if tail:
+            return tail
+    if rr:
+        return rr
+    return _norm(d.get("Rule") or "")
+
+
+def _fuel_surcharge_applies_if_display(d: dict[str, Any]) -> str:
+    label = _norm(d.get("Cost_type") or "")
+    ai = _norm(d.get("Applies_if") or "")
+    rb = _norm(d.get("Rate_by") or "")
+    if label.lower().startswith("fuel surcharge ("):
+        return f"{label}\n{ai}".strip() if ai else label
+    if ai and rb and "validity period" in rb.lower():
+        return f"{ai}\n{rb}".strip() if ai else rb
+    return ai or label
 
 
 def _quantity_container_size_digits_from_rate_by(rate_by: str) -> str:
@@ -268,10 +395,57 @@ def _def_quantity_container_matches_measurement(d: dict[str, Any], row: dict[str
     return _measurement_lists_quantity_container_size(row, sz)
 
 
+def _definition_ordinal_among_same_cost_type(
+    all_defs: list[dict[str, Any]], selected: dict[str, Any]
+) -> int:
+    """
+    Position of *selected* among ``cost_definitions`` rows with the same ``Cost_type``
+    (file order). Used when the lane lists several ``Costs`` rows with identical
+    ``Cost Type`` text for different validity periods.
+    """
+    ct = _norm(selected.get("Cost_type"))
+    ai_sel = _norm(selected.get("Applies_if"))
+    k = 0
+    for d in all_defs:
+        if not isinstance(d, dict) or d.get("grouped_cost"):
+            continue
+        if _norm(d.get("Cost_type")) != ct:
+            continue
+        if _norm(d.get("Applies_if")) == ai_sel:
+            return k
+        k += 1
+    return -1
+
+
+def _disambiguate_same_cost_type_transport_lane_rows(
+    narrow: list[dict[str, Any]],
+    d_sel: dict[str, Any],
+    all_defs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Non-grouped transport often repeats the same ``Cost Type`` string on multiple lane
+    rows (one per validity block) without per-line dates. Pick the row whose position
+    matches the selected definition's ordinal among same-``Cost_type`` blocks.
+    """
+    if len(narrow) <= 1:
+        return narrow
+    if d_sel.get("grouped_cost"):
+        return narrow
+    ct = _norm(d_sel.get("Cost_type"))
+    if "transport cost" not in ct.lower():
+        return narrow
+    ord_idx = _definition_ordinal_among_same_cost_type(all_defs, d_sel)
+    if ord_idx < 0:
+        return narrow
+    pick = min(ord_idx, len(narrow) - 1)
+    return [narrow[pick]]
+
+
 def _pick_lane_cost_definition_and_rows(
     defs_for_type: list[dict[str, Any]],
     costs: list[dict[str, Any]],
     row: dict[str, Any],
+    all_cost_definitions: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
     """
     Choose one ``cost_definitions`` row and matching ``Costs`` lines (exact ``Cost Type``,
@@ -293,9 +467,27 @@ def _pick_lane_cost_definition_and_rows(
         d0 = defs_work[0]
 
     ct_full = _norm(d0.get("Cost_type"))
-    narrow = [c for c in costs if _norm(c.get("Cost Type")) == ct_full]
+    narrow = [
+        c
+        for c in costs
+        if _norm(c.get("Cost Type")) == ct_full
+        or _norm(c.get("Grouped under")) == ct_full
+    ]
     if not narrow:
         return d0, costs
+
+    narrow = [c for c in narrow if _lane_cost_line_valid_for_ship_date(c, row)]
+    ct_g = _norm(d0.get("Cost_type")).lower()
+    if d0.get("grouped_cost") and "grouped cost:" in ct_g and "transport cost" in ct_g:
+        narrow = [
+            c
+            for c in narrow
+            if not _cost_line_is_hk_transport_discount(c)
+            or _hk_transport_discount_applies_for_row(row)
+        ]
+
+    if len(narrow) > 1 and all_cost_definitions is not None:
+        narrow = _disambiguate_same_cost_type_transport_lane_rows(narrow, d0, all_cost_definitions)
 
     siblings = [d for d in defs_work if _norm(d.get("Cost_type")) == ct_full]
     if len(siblings) > 1 and len(narrow) == len(siblings):
@@ -358,6 +550,80 @@ def _grouped_transport_def_valid_for_ship_date(
     if dt is not None and ship > dt:
         return False
     return True
+
+
+def _lane_cost_line_valid_for_ship_date(cost: dict[str, Any], row: dict[str, Any]) -> bool:
+    """Lane ``Costs`` row ``Validity from`` / ``Validity to`` contains shipment date when present."""
+    vf = cost.get("Validity from") or cost.get("Validity From")
+    vt = cost.get("Validity to") or cost.get("Validity To")
+    if vf is None and vt is None:
+        return True
+    ship = _row_ship_date_as_date(row)
+    if ship is None:
+        return True
+    df = _parse_date_for_validity(str(vf)) if vf else None
+    dt = _parse_date_for_validity(str(vt)) if vt else None
+    if df is not None and ship < df:
+        return False
+    if dt is not None and ship > dt:
+        return False
+    return True
+
+
+def _cost_line_is_hk_transport_discount(cost: dict[str, Any]) -> bool:
+    ct = _norm(cost.get("Cost Type")).lower()
+    return "hong kong discount" in ct
+
+
+def _hk_transport_discount_applies_for_row(row: dict[str, Any]) -> bool:
+    """
+    Hong Kong discount lines on the rate card require HK origin (postal zone / SAR).
+    When origin country is not HK, use the base grouped transport line instead.
+    """
+    for key in ("SHIP_COUNTRY", "SHIP_COUNTRY_ETOF", "SHIP_COUNTRY_ISD"):
+        c = _norm(str(row.get(key) or "")).upper()
+        if c in ("HK", "HKG"):
+            return True
+    return False
+
+
+def _grouped_weight_sub_rate_by(
+    definition: dict[str, Any], costs_use: list[dict[str, Any]]
+) -> str:
+    """``Rate_by`` on grouped ``Transport cost`` rows is often empty; sub_costs carry Weight/chargeable kg."""
+    subs = definition.get("sub_cost_definitions") or []
+    if not subs:
+        return ""
+    names_in_lane = {_norm(c.get("Cost Type")) for c in costs_use}
+    for sub in subs:
+        if not isinstance(sub, dict):
+            continue
+        rb = _norm(sub.get("Rate_by") or "")
+        if not rb or rb.lower().startswith("container/"):
+            continue
+        sn = _norm(sub.get("sub_cost_name") or "")
+        if sn and sn in names_in_lane:
+            return rb
+    return ""
+
+
+def _grouped_sub_rate_bys_for_display(definition: dict[str, Any]) -> str:
+    """Non-container ``Rate_by`` strings from ``sub_cost_definitions`` for enriched output."""
+    if not definition.get("grouped_cost"):
+        return ""
+    subs = definition.get("sub_cost_definitions") or []
+    out: list[str] = []
+    seen: set[str] = set()
+    for sub in subs:
+        if not isinstance(sub, dict):
+            continue
+        rb = _norm(sub.get("Rate_by") or "")
+        if not rb or rb.lower().startswith("container/"):
+            continue
+        if rb not in seen:
+            seen.add(rb)
+            out.append(rb)
+    return "; ".join(out)
 
 
 def _norm_measurement_token(s: str) -> str:
@@ -442,11 +708,18 @@ def _lane_cost_for_grouped_sub(
     return None
 
 
+def _accessorial_block_matches_row_cost_type(row_cost_type: str, block: dict[str, Any]) -> bool:
+    """Short mismatch label (e.g. ``Handling``) vs accessorial ``Cost type`` (full name in parentheses)."""
+    if not isinstance(block, dict):
+        return False
+    return _cost_type_matches_row_to_card(_norm(row_cost_type), block.get("Cost type"))
+
+
 def _cost_blocks_from_accessorial(
     accessorial: list[dict[str, Any]], cost_type: str
 ) -> list[dict[str, Any]]:
     ct = _norm(cost_type)
-    return [b for b in accessorial if _norm(b.get("Cost type")) == ct]
+    return [b for b in accessorial if _accessorial_block_matches_row_cost_type(ct, b)]
 
 
 def _is_fuel_surcharge_cost_type(cost_type: Optional[str]) -> bool:
@@ -529,8 +802,18 @@ def compute_fuel_surcharge_carrier_rate_file(
 def _fields_from_filtered_definitions(matches: list[dict[str, Any]]) -> tuple[str, str, str]:
     if not matches:
         return "", "", ""
+    if len(matches) == 1 and _is_fuel_surcharge_cost_definition(matches[0]):
+        d0 = matches[0]
+        applies = _fuel_surcharge_applies_if_display(d0)
+        rates = _effective_rate_by_from_merged_card_row(d0)
+        rounds = _fuel_surcharge_rounding_rule_for_calc(d0)
+        return applies, rates, rounds
     applies = _merge_multi([m.get("Applies_if") for m in matches])
     rates = _merge_multi([m.get("Rate_by") for m in matches])
+    if not _norm(rates):
+        sub_rb = _merge_multi([_grouped_sub_rate_bys_for_display(m) for m in matches])
+        if _norm(sub_rb):
+            rates = sub_rb
     rounds = _merge_multi([m.get("Rounding_rule") for m in matches])
     return applies, rates, rounds
 
@@ -851,7 +1134,6 @@ def accessorial_equipment_type_not_met_comment(
     """
     When a tier is blocked solely because ``Equipment Type contains …`` does not match ``CONT_LOAD``.
     """
-    ct = _norm(cost_type)
     seen: set[str] = set()
     for ln in lane_nums:
         lane_key = str(ln).strip() if ln is not None else ""
@@ -859,7 +1141,7 @@ def accessorial_equipment_type_not_met_comment(
             continue
         seen.add(lane_key)
         for b in blocks:
-            if _norm(b.get("Cost type")) != ct:
+            if not _accessorial_block_matches_row_cost_type(cost_type, b):
                 continue
             for t in b.get("Tiers") or []:
                 if str(t.get("Lane #", "")).strip() != lane_key:
@@ -890,8 +1172,6 @@ def accessorial_measurement_missing_comment(
     the standard comment. Checks tiers for ``lane_num`` first, then any tier in the block
     (accessorial often uses Lane # 1 while ``best_lane(s)`` is another lane).
     """
-    ct = _norm(cost_type)
-
     def _scan_tiers(tiers: list[dict[str, Any]], lane_filter: Optional[str]) -> str:
         for t in tiers:
             if lane_filter is not None and str(t.get("Lane #", "")).strip() != lane_filter:
@@ -909,7 +1189,7 @@ def accessorial_measurement_missing_comment(
         return ""
 
     for b in blocks:
-        if _norm(b.get("Cost type")) != ct:
+        if not _accessorial_block_matches_row_cost_type(cost_type, b):
             continue
         tiers = b.get("Tiers") or []
         msg = _scan_tiers(tiers, lane_num)
@@ -1005,6 +1285,118 @@ def _tiers_matching_target_price(
     return out
 
 
+def _sub_cost_name_to_container_rate_by(filtered: dict[str, Any]) -> dict[str, str]:
+    """Map grouped ``sub_cost_name`` → ``Rate_by`` (e.g. ``Container/40CZ``) from ``cost_definitions``."""
+    out: dict[str, str] = {}
+    for d in filtered.get("cost_definitions") or []:
+        if not d.get("grouped_cost"):
+            continue
+        for sub in d.get("sub_cost_definitions") or []:
+            if not isinstance(sub, dict):
+                continue
+            name = _norm(sub.get("sub_cost_name"))
+            rb = _norm(sub.get("Rate_by"))
+            if name and rb:
+                out[name] = rb
+    return out
+
+
+def _lane_cost_validity_compact(c: dict[str, Any]) -> str:
+    """``dd.mm.yyyy-dd.mm.yyyy`` from lane ``Costs`` row, or shortened ``Validity period``."""
+    vf = _norm(c.get("Validity from"))
+    vt = _norm(c.get("Validity to"))
+    if vf and vt:
+        return f"{vf}-{vt}"
+    vp = _norm(c.get("Validity period"))
+    if not vp:
+        return ""
+    vp = re.sub(r"(?i)^\s*from\s+", "", vp).strip()
+    vp = re.sub(r"\s+to\s+", "-", vp)
+    vp = re.sub(r"\s+", "", vp)
+    return vp
+
+
+def _tier_detail_entries_for_target_price(
+    amount: Optional[float],
+    filtered: Optional[dict[str, Any]],
+    cost_type: Optional[str],
+) -> list[dict[str, str]]:
+    """
+    Every lane ``Costs`` line whose ``Price`` matches ``amount`` (2dp) and ``Cost Type`` matches
+    ``cost_type`` — no deduplication by (lane, weight bracket), so grouped transport rows that
+    share the same price but differ by sub-cost / validity are all kept.
+    """
+    if filtered is None or cost_type is None or amount is None:
+        return []
+    try:
+        target = round(float(amount) + 1e-8, 2)
+    except (TypeError, ValueError):
+        return []
+    ct = _norm(str(cost_type))
+    if not ct:
+        return []
+    sub_rb = _sub_cost_name_to_container_rate_by(filtered)
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for lane in filtered.get("rate_card_data") or []:
+        lane_num = str(lane.get("Lane #", "")).strip()
+        for c in lane.get("Costs") or []:
+            if not isinstance(c, dict):
+                continue
+            if not _cost_type_matches_row_to_card(ct, c.get("Cost Type")):
+                continue
+            p = c.get("Price")
+            if p is None:
+                continue
+            try:
+                pf = float(p)
+            except (TypeError, ValueError):
+                continue
+            if round(pf, 2) != target:
+                continue
+            wb = _norm(c.get("Weight Bracket"))
+            line_name = _norm(c.get("Cost Type"))
+            val = _lane_cost_validity_compact(c)
+            tok = sub_rb.get(line_name, "")
+            key = (lane_num, line_name, val, wb)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "lane": lane_num,
+                    "wb": wb,
+                    "line_name": line_name,
+                    "validity": val,
+                    "rate_by_token": tok,
+                }
+            )
+    return out
+
+
+def _format_tier_match_entries_transport_detail(entries: list[dict[str, str]]) -> str:
+    """
+    Human-readable alternatives when the same amount matches several grouped transport lines
+    (same lane, empty weight bracket, different sub-cost / ``Container/…`` / validity).
+    """
+    parts: list[str] = []
+    for e in entries:
+        ln = e.get("lane") or ""
+        cname = e.get("line_name") or ""
+        tok = (e.get("rate_by_token") or "").strip()
+        wb = (e.get("wb") or "").strip()
+        val = (e.get("validity") or "").strip()
+        seg = f'Lane #: {ln}, cost "{cname}"'
+        if tok:
+            seg += f' - "{tok}"'
+        if wb:
+            seg += f", Weight Bracket: {wb}"
+        if val:
+            seg += f", ({val})"
+        parts.append(seg)
+    return "; ".join(parts)
+
+
 def _match_cost_tiers_body_for_target_price(
     amount: Optional[float],
     filtered: Optional[dict[str, Any]],
@@ -1021,10 +1413,16 @@ def _match_cost_tiers_body_for_target_price(
         return ""
     if amount is None:
         return ""
-    pairs = _tiers_matching_target_price(amount, filtered, cost_type)
-    if not pairs:
+    details = _tier_detail_entries_for_target_price(amount, filtered, cost_type)
+    if not details:
         return MSG_NO_LANE_SAME_COST
-    return "; ".join(f"Lane #: {ln}, Weight Bracket: {wb}" for ln, wb in pairs)
+    if len(details) > 1:
+        return _format_tier_match_entries_transport_detail(details)
+    e0 = details[0]
+    wb0 = (e0.get("wb") or "").strip()
+    if wb0:
+        return f"Lane #: {e0['lane']}, Weight Bracket: {wb0}"
+    return _format_tier_match_entries_transport_detail(details)
 
 
 def primary_rate_card_alternate_lane_tier_strings(
@@ -1038,15 +1436,22 @@ def primary_rate_card_alternate_lane_tier_strings(
     Same agreement RA: lanes whose tier price matches ``amount`` but whose lane id differs
     from the first ``best_lane(s)`` id. Used when there is no secondary rate card file but
     another lane (e.g. different Equipment Type) carries the same tier price.
+
+    Uses the same detailed strings as :func:`_match_cost_tiers_body_for_target_price` (cost name,
+    ``Container/…``, validity) — not only ``Lane #`` + empty weight bracket.
     """
     if not isinstance(filtered, dict):
         return ""
-    best_ln = _first_lane_number(best_lane_str) or ""
-    pairs = _tiers_matching_target_price(amount, filtered, cost_type)
-    alt = [(ln, wb) for ln, wb in pairs if ln and ln != best_ln]
+    best_ln = (_first_lane_number(best_lane_str) or "").strip()
+    details = _tier_detail_entries_for_target_price(amount, filtered, cost_type)
+    alt = [
+        e
+        for e in details
+        if str(e.get("lane") or "").strip() and str(e.get("lane")).strip() != best_ln
+    ]
     if not alt:
         return ""
-    body = "; ".join(f"Lane #: {ln}, Weight Bracket: {wb}" for ln, wb in alt)
+    body = _format_tier_match_entries_transport_detail(alt)
     return _prefix_rate_agreement_id(body, agreement_ra)
 
 
@@ -2471,26 +2876,60 @@ def compute_lane_rate_cost_and_tier(
         return None, None
 
     ct = _norm(cost_type)
-    costs = [
-        c
-        for c in (lane.get("Costs") or [])
-        if _cost_type_matches_row_to_card(ct, c.get("Cost Type"))
-    ]
-    if not costs:
-        return None, None
-
-    costs_use = costs
+    lane_costs = lane.get("Costs") or []
+    costs_use: list[dict[str, Any]] = []
     rate_by = ""
     rounding_rule = ""
+
     if defs_for_type:
         if not any(applies_if_allows(d.get("Applies_if") or "", row) for d in defs_for_type):
             return None, None
-        d_sel, costs_use = _pick_lane_cost_definition_and_rows(defs_for_type, costs, row)
-        if d_sel is None:
+        costs_normal = [
+            c
+            for c in lane_costs
+            if _cost_type_matches_row_to_card(ct, c.get("Cost Type"))
+        ]
+        if costs_normal:
+            d_sel, costs_use = _pick_lane_cost_definition_and_rows(
+                defs_for_type,
+                costs_normal,
+                row,
+                filtered.get("cost_definitions"),
+            )
+            if d_sel is None:
+                return None, None
+            if not costs_use:
+                return None, None
+            rate_by = (d_sel.get("Rate_by") or "").strip()
+            rounding_rule = d_sel.get("Rounding_rule") or ""
+            if not (rounding_rule or "").strip() and _is_fuel_surcharge_cost_definition(d_sel):
+                rounding_rule = _fuel_surcharge_rounding_rule_for_calc(d_sel)
+            if not rate_by and isinstance(d_sel, dict) and d_sel.get("grouped_cost"):
+                merged_rb = _grouped_weight_sub_rate_by(d_sel, costs_use)
+                if merged_rb:
+                    rate_by = merged_rb
+        elif len(defs_for_type) == 1 and _is_fuel_surcharge_cost_definition(defs_for_type[0]):
+            d_sel = defs_for_type[0]
+            costs_use = _fuel_surcharge_lane_cost_rows_for_def(
+                lane_costs,
+                filtered.get("cost_definitions") or [],
+                d_sel,
+            )
+            if not costs_use:
+                return None, None
+            rate_by = _effective_rate_by_from_merged_card_row(d_sel)
+            rounding_rule = _fuel_surcharge_rounding_rule_for_calc(d_sel)
+        else:
             return None, None
-        rate_by = (d_sel.get("Rate_by") or "").strip()
-        rounding_rule = d_sel.get("Rounding_rule") or ""
     else:
+        costs = [
+            c
+            for c in lane_costs
+            if _cost_type_matches_row_to_card(ct, c.get("Cost Type"))
+        ]
+        if not costs:
+            return None, None
+        costs_use = costs
         if any(str(c.get("Weight Bracket", "")).strip() for c in costs):
             rate_by = "Weight/chargeable kg"
 
@@ -2589,9 +3028,8 @@ def accessorial_price_and_tier_for_lane(
     First matching tier Price + tier row (Lane #, Cost type) where tier ``Applies if`` holds
     (accessorial rules: Cost/… is available, Service does not equal …, etc.).
     """
-    ct = _norm(cost_type)
     for b in blocks:
-        if _norm(b.get("Cost type")) != ct:
+        if not _accessorial_block_matches_row_cost_type(cost_type, b):
             continue
         for t in b.get("Tiers") or []:
             if str(t.get("Lane #", "")).strip() != lane_num:
