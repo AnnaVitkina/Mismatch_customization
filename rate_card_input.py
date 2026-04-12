@@ -945,6 +945,9 @@ def _repair_misplaced_non_grouped_cost_definition(cd: dict) -> dict:
     - **Case C**: ``Cost_type`` empty; title in ``Applies_if``; ``Validity period`` (or similar)
       in ``Rate_by``; ``Applies if`` body (and optional ``Cost to prolong``) in ``Rule``;
       true ``Rate by: …; Regular rule`` in ``Rounding_rule``.
+    - **Case D**: Like Case C, but ``Rule`` is only ``Cost to prolong: …`` (no ``Applies if`` text).
+      Used for **Fuel Surcharge** monthly rows; ``Cost_type`` becomes the title (e.g.
+      ``Fuel Surcharge (May 2025)``), ``Rate_by`` becomes ``Weight/chargeable kg``.
     - **Case B**: ``Cost_type`` empty; cost title in ``Applies_if``; ``Rate_by``/``Rule`` empty;
       ``Rounding_rule`` holds ``Rate by: …`` (and often ``; Regular rule``).
     - **Case A**: ``Cost_type`` empty; title in ``Applies_if``; real ``Applies if`` line wrongly
@@ -1004,6 +1007,32 @@ def _repair_misplaced_non_grouped_cost_definition(cd: dict) -> dict:
                 out["Rounding_rule"] = ""
                 return out
 
+    # Case D: Fuel Surcharge (and similar calendar tiers) — same merged cells as Case C, but
+    # ``Rule`` is ``Cost to prolong: …`` (no ``Applies if`` paragraph), so Case C never runs.
+    if (
+        not ct
+        and app
+        and rb
+        and rr
+        and _looks_like_cost_type_title_row(app)
+        and _cell_looks_like_validity_period_line(rb)
+        and _rounding_cell_looks_like_stray_rate_by_block(rr)
+    ):
+        rule_low = _normalize_excel_cell_text(rule).lower()
+        if "applies if" not in rule_low and not _looks_like_metadata_applies_if_line(rule or ""):
+            new_rate_by, new_rule = _parse_rate_by_rule_line(rr)
+            if new_rate_by:
+                out = dict(cd)
+                out["Cost_type"] = app
+                applies_parts: list[str] = [rb.strip()]
+                if rule and str(rule).strip():
+                    applies_parts.append(str(rule).strip())
+                out["Applies_if"] = "\n".join(applies_parts).strip()
+                out["Rate_by"] = new_rate_by
+                out["Rule"] = new_rule or ""
+                out["Rounding_rule"] = ""
+                return out
+
     # Case A
     if not app or not rb:
         return cd
@@ -1026,6 +1055,9 @@ def sanitize_filtered_rate_card_json_object(data: dict) -> dict:
     Fix legacy JSON where non-grouped ``cost_definitions`` rows were shifted (empty
     ``Cost_type``, title in ``Applies_if``, etc.) and backfill empty lane ``Cost Type``
     when there is exactly one non-grouped definition.
+
+    Fuel Surcharge calendar rows are normalized by :func:`_repair_misplaced_non_grouped_cost_definition`
+    (Case D); lane ``Costs`` titles are then aligned via :func:`_backfill_lane_fuel_surcharge_cost_types`.
     """
     if not isinstance(data, dict):
         return data
@@ -1039,6 +1071,7 @@ def sanitize_filtered_rate_card_json_object(data: dict) -> dict:
                 fixed.append(x)
         data["cost_definitions"] = fixed
         defs = fixed
+        _backfill_lane_fuel_surcharge_cost_types(data)
     single_ct = ""
     if isinstance(defs, list) and len(defs) == 1:
         d0 = defs[0]
@@ -1053,6 +1086,43 @@ def sanitize_filtered_rate_card_json_object(data: dict) -> dict:
                     if isinstance(c, dict) and not str(c.get("Cost Type") or "").strip():
                         c["Cost Type"] = single_ct
     return data
+
+
+def _backfill_lane_fuel_surcharge_cost_types(data: dict) -> None:
+    """
+    After Case D repair, each monthly Fuel Surcharge has ``Cost_type`` ``Fuel Surcharge (…)``.
+    Lane ``Costs`` rows are still a band of empty ``Cost Type`` cells in file order — copy the
+    matching definition title onto each row so lookups work without positional heuristics.
+    """
+    defs = data.get("cost_definitions") or []
+    if not isinstance(defs, list):
+        return
+    fuel: list[dict] = []
+    for d in defs:
+        if not isinstance(d, dict) or d.get("grouped_cost"):
+            continue
+        ct = str(d.get("Cost_type") or "").strip()
+        if ct.lower().startswith("fuel surcharge ("):
+            fuel.append(d)
+    if not fuel:
+        return
+    for lane in data.get("rate_card_data") or []:
+        if not isinstance(lane, dict):
+            continue
+        costs = lane.get("Costs") or []
+        idxs: list[int] = []
+        for i, c in enumerate(costs):
+            if not isinstance(c, dict):
+                continue
+            if not str(c.get("Cost Type") or "").strip():
+                idxs.append(i)
+            elif idxs:
+                break
+        n = min(len(idxs), len(fuel))
+        for j in range(n):
+            title = str(fuel[j].get("Cost_type") or "").strip()
+            if title:
+                costs[idxs[j]]["Cost Type"] = title
 
 
 def _coerce_cost_price(val):
@@ -1750,7 +1820,8 @@ if __name__ == "__main__":
 
     # One or more rate cards under input/ (RA######## in the filename -> Filtered_Rate_Card_with_Conditions_RA########.json)
     _default_inputs = [
-        "Advanced Export - RA20241217021 v.10 - MAERSK Consolidator.xlsx",
+        "Advanced Export - RA20250815027 v.11 - SCH GOR25 (Fast Boat) 3.xlsx",
+        "Advanced Export - RA20240913026 v.12 - SCH GOR24 (Fast Boat).xlsx"
         
     ]
     INPUT_FILES = sys.argv[1:] if len(sys.argv) > 1 else _default_inputs
