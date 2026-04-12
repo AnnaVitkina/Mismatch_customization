@@ -333,7 +333,26 @@ ETOF_TO_RATE_CARD_MAPPING = {
     'Lane Type': 'ORIGINAL_SERVICE',
     'Carrier Account Number': 'Billing account',
     'Shipping Condition': 'INVOICE_ENTITY',
+    'Carrier Name': 'CARRIER_NAME',
 }
+
+
+def _user_mapped_etof_column(rate_card_col: str) -> Optional[str]:
+    """
+    Resolve ETOF column from :data:`ETOF_TO_RATE_CARD_MAPPING`.
+    Matches rate card keys with **strip** and **case-insensitive** comparison so
+    ``Carrier Name`` overrides fuzzy mapping to ``Carrier agreement #`` reliably.
+    """
+    if not ETOF_TO_RATE_CARD_MAPPING or rate_card_col is None:
+        return None
+    rc = str(rate_card_col).strip()
+    if rc in ETOF_TO_RATE_CARD_MAPPING:
+        return ETOF_TO_RATE_CARD_MAPPING[rc]
+    rcl = rc.lower()
+    for k, v in ETOF_TO_RATE_CARD_MAPPING.items():
+        if str(k).strip().lower() == rcl:
+            return v
+    return None
 
 
 def is_excluded_column(column_name):
@@ -436,12 +455,15 @@ def create_vocabulary_dataframe(
     
     # Step 2: Collect columns from all sources (excluding specified columns)
     all_source_columns = {}
-    
+    # Full ETOF column names (before excluding ``CARRIER_NAME`` etc.) for user overrides only.
+    etof_columns_full_for_user_map: list[str] = []
+
     if etof_file_path:
         print("\n2. Processing ETOF file...")
         try:
             etof_df, etof_columns = process_etof_file(etof_file_path)
-            # Filter out excluded columns (case-insensitive)
+            etof_columns_full_for_user_map = list(etof_columns)
+            # Filter out excluded columns for fuzzy matching — user map can still target excluded names.
             excluded_etof = [col for col in etof_columns if is_excluded_column(col)]
             etof_columns = [col for col in etof_columns if not is_excluded_column(col)]
             all_source_columns['ETOF'] = etof_columns
@@ -480,25 +502,31 @@ def create_vocabulary_dataframe(
             if existing_mapping:
                 continue
             
-            available_columns = [col for col in source_columns if col not in used_source_columns[source_name]]
-            if not available_columns:
-                continue
-            
-            # User mapping first (only for ETOF source)
             match = None
             confidence = 0.0
             method = 'fuzzy'
-            if source_name == 'ETOF' and ETOF_TO_RATE_CARD_MAPPING and standard_col in ETOF_TO_RATE_CARD_MAPPING:
-                user_etof_col = ETOF_TO_RATE_CARD_MAPPING[standard_col]
-                if user_etof_col in available_columns:
+            # User mapping first (only for ETOF); may target columns excluded from fuzzy pool (e.g. CARRIER_NAME)
+            if source_name == 'ETOF' and ETOF_TO_RATE_CARD_MAPPING:
+                user_etof_col = _user_mapped_etof_column(standard_col)
+                if (
+                    user_etof_col is not None
+                    and user_etof_col in etof_columns_full_for_user_map
+                    and user_etof_col not in used_source_columns[source_name]
+                ):
                     match = user_etof_col
                     confidence = 1.0
                     method = 'user'
             if not match:
+                available_columns = [col for col in source_columns if col not in used_source_columns[source_name]]
+                if not available_columns:
+                    continue
                 match, confidence, method = find_column_match(standard_col, available_columns, threshold=0.3)
                 method = method or 'fuzzy'
             if match:
-                if is_excluded_column(standard_col) or is_excluded_column(match):
+                if is_excluded_column(standard_col):
+                    continue
+                # Fuzzy must not map *to* excluded ETOF columns; explicit user map may (e.g. CARRIER_NAME).
+                if method != 'user' and is_excluded_column(match):
                     continue
                 vocabulary_data.append({
                     'Standard_Name': standard_col,
@@ -777,25 +805,27 @@ def map_and_rename_columns(
     for rate_card_col in rate_card_columns:
         etof_match = None
         rule = None
-        etof_columns = [col for col in etof_df.columns 
-                        if not is_excluded_column(col) and col not in used_etof_columns]
-        if etof_columns:
-            # User mapping first
-            if ETOF_TO_RATE_CARD_MAPPING and rate_card_col in ETOF_TO_RATE_CARD_MAPPING:
-                user_col = ETOF_TO_RATE_CARD_MAPPING[rate_card_col]
-                if user_col in etof_columns and user_col not in used_etof_columns:
-                    etof_match = user_col
-                    rule = 'user'
-            if etof_match is None:
-                match, _, rule = find_column_match(rate_card_col, etof_columns, threshold=0.3)
-                if match and not is_excluded_column(match) and match not in used_etof_columns:
-                    etof_match = match
-                if rule is None and etof_match is None:
-                    rule = 'none'
-            if etof_match is not None:
-                etof_mappings[rate_card_col] = etof_match
-                used_etof_columns.add(etof_match)
-        
+        # User mapping may target columns omitted from fuzzy pool (e.g. ``CARRIER_NAME`` in EXCLUDED_COLUMNS).
+        user_col = _user_mapped_etof_column(rate_card_col)
+        if user_col is not None and user_col not in used_etof_columns:
+            if user_col in etof_df.columns:
+                etof_match = user_col
+                rule = 'user'
+        etof_columns = [
+            col
+            for col in etof_df.columns
+            if not is_excluded_column(col) and col not in used_etof_columns
+        ]
+        if etof_match is None and etof_columns:
+            match, _, rule = find_column_match(rate_card_col, etof_columns, threshold=0.3)
+            if match and not is_excluded_column(match) and match not in used_etof_columns:
+                etof_match = match
+            if rule is None and etof_match is None:
+                rule = 'none'
+        if etof_match is not None:
+            etof_mappings[rate_card_col] = etof_match
+            used_etof_columns.add(etof_match)
+
         mapping_results.append({
             'Rate_Card_Column': rate_card_col,
             'ETOF_Column': etof_match if etof_match else 'NONE',
@@ -1145,7 +1175,7 @@ if __name__ == "__main__":
         # Main function: Map and rename columns
         etof_renamed, lc_renamed, origin_renamed = map_and_rename_columns(
             rate_card_file_path=None,
-            etof_file_path="etofs (24).xlsx",
+            etof_file_path="etofs_03.04.2026 (GOR25 - Fastboat) 3.xlsx",
         )
     except Exception:
         pass  
