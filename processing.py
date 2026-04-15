@@ -2851,24 +2851,43 @@ def format_transport_grouped_possible_rate_card_value_used(
     """
     Compare invoice amount to lane tier lines; explain when the same price applies to other
     container types (e.g. 40′) while calculation used MEASUREMENT (e.g. 20′).
+
+    Tier lookups mirror :func:`format_possible_rate_card_value_used`: **Carrier rate file**
+    (per-unit after grouped division) and **invoice total** are both matched to tier
+    ``Price`` rows. Previously only the invoice total was matched (often a large total that
+    never equals a per-container tier), which produced ``MSG_NO_LANE_SAME_COST`` while
+    ``Another_rate_card_Carrier_used`` correctly matched :func:`compute_grouped_transport_carrier_rate_file`.
     """
     inv = _invoice_statement_cost_inv_curr(row)
     ship = _row_ship_date_as_date(row)
+    cost_type = row.get("Cost type")
+    crf = compute_grouped_transport_carrier_rate_file(row, result)
     inv_names = _transport_tier_names_matching_invoice_on_lane(
         filtered, lane_num, ship, inv
     )
     matched_set = {_norm(n) for n in result.matched_sub_cost_names}
     alt = [n for n in inv_names if _norm(n) not in matched_set]
+    parts: list[str] = []
     if alt:
-        body = (
+        parts.append(
             f"Lane #: {lane_num}, invoice amount matches rate line(s) for "
             f"{', '.join(alt)} (valid for shipment date); calculation uses "
             f"{', '.join(result.matched_sub_cost_names)} from MEASUREMENT."
         )
-        return _prefix_rate_agreement_id(body, rate_agreement_id)
-    body = _match_cost_tiers_body_for_target_price(inv, filtered, "Transport cost")
-    if body == "":
+    tier_parts: list[str] = []
+    if crf is not None:
+        m = _match_cost_tiers_body_for_target_price(crf, filtered, cost_type)
+        lab = _money_amount_display_2dp(float(crf))
+        tier_parts.append(f"Carrier rate file ({lab}): {m}")
+    if inv is not None:
+        m = _match_cost_tiers_body_for_target_price(inv, filtered, cost_type)
+        lab = _money_amount_display_2dp(float(inv))
+        tier_parts.append(f"Invoice amount ({lab}): {m}")
+    if tier_parts:
+        parts.append(" | ".join(tier_parts))
+    if not parts:
         return ""
+    body = " | ".join(parts)
     return _prefix_rate_agreement_id(body, rate_agreement_id)
 
 
