@@ -426,6 +426,10 @@ def _disambiguate_same_cost_type_transport_lane_rows(
     Non-grouped transport often repeats the same ``Cost Type`` string on multiple lane
     rows (one per validity block) without per-line dates. Pick the row whose position
     matches the selected definition's ordinal among same-``Cost_type`` blocks.
+
+    When only **one** ``cost_definitions`` row exists for that ``Cost_type``, multiple lane
+    rows are usually **alternatives** (e.g. Flat MIN vs per-kg ``p/unit``) — do not collapse
+    to a single row; leave tier selection to :func:`pick_tightest_weight_tier`.
     """
     if len(narrow) <= 1:
         return narrow
@@ -433,6 +437,14 @@ def _disambiguate_same_cost_type_transport_lane_rows(
         return narrow
     ct = _norm(d_sel.get("Cost_type"))
     if "transport cost" not in ct.lower():
+        return narrow
+    same_ct = 0
+    for d in all_defs:
+        if not isinstance(d, dict) or d.get("grouped_cost"):
+            continue
+        if _norm(d.get("Cost_type")) == ct:
+            same_ct += 1
+    if same_ct <= 1:
         return narrow
     ord_idx = _definition_ordinal_among_same_cost_type(all_defs, d_sel)
     if ord_idx < 0:
@@ -866,14 +878,45 @@ def _chargeable_weight(row: dict[str, Any]) -> Optional[float]:
 
 
 def _weight_etof(row: dict[str, Any]) -> Optional[float]:
-    """``WEIGHT_ETOF`` when ``Rate_by`` is ``Weight/kg`` (see :func:`_rate_by_is_weight_kg_etof`)."""
-    w = row.get("WEIGHT_ETOF")
-    if w is None or (isinstance(w, float) and pd.isna(w)):
-        return None
-    try:
-        return float(w)
-    except (TypeError, ValueError):
-        return None
+    """
+    Kg for ``Weight/kg`` pricing. Prefer ``WEIGHT_ETOF``; if missing (common on truck/LTL extracts),
+    use ``CHARGEABLE WEIGHT`` or ``CHARGE_WEIGHT_ETOF`` / ``WEIGHT_ISD`` so tier math matches billing weight.
+    """
+    for key in (
+        "WEIGHT_ETOF",
+        "WEIGHT_ISD",
+        "CHARGEABLE WEIGHT",
+        "CHARGE_WEIGHT_ETOF",
+        "CHARGE_WEIGHT_ISD",
+    ):
+        w = row.get(key)
+        if w is None or (isinstance(w, float) and pd.isna(w)):
+            continue
+        try:
+            return float(w)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _weight_source_label_for_weight_kg(row: dict[str, Any]) -> str:
+    """Column name for Rate_cost_comment; mirrors :func:`_weight_etof` resolution order."""
+    for key in (
+        "WEIGHT_ETOF",
+        "WEIGHT_ISD",
+        "CHARGEABLE WEIGHT",
+        "CHARGE_WEIGHT_ETOF",
+        "CHARGE_WEIGHT_ISD",
+    ):
+        w = row.get(key)
+        if w is None or (isinstance(w, float) and pd.isna(w)):
+            continue
+        try:
+            float(w)
+        except (TypeError, ValueError):
+            continue
+        return key
+    return "kg"
 
 
 def _cbm_value(row: dict[str, Any]) -> Optional[float]:
@@ -1666,7 +1709,7 @@ def _rate_by_is_weight_chargeable(rate_by: str) -> bool:
 def _rate_by_is_weight_kg_etof(rate_by: str) -> bool:
     """
     True for ``Weight/kg`` (rate by weight in kg without “chargeable” in the card text).
-    Uses :func:`_weight_etof` (``WEIGHT_ETOF``).
+    Uses :func:`_weight_etof` (WEIGHT_ETOF, else CHARGEABLE WEIGHT when ETOF weight absent).
     """
     rb = _normalize_rate_by_string(rate_by).lower()
     if "chargeable" in rb:
@@ -1718,7 +1761,7 @@ def compute_rate_cost_calculated(
     """
     per shipment: Rate cost × 1.
     Weight/chargeable kg: Flat → ×1; p/unit → Rate cost × CHARGEABLE WEIGHT.
-    Weight/kg: same tier rules but × WEIGHT_ETOF.
+    Weight/kg: same tier rules but × kg from :func:`_weight_etof` (WEIGHT_ETOF, else CHARGEABLE WEIGHT, etc.).
     Quantity/Container: p/unit → Rate cost × sum of units for MEASUREMENT segments containing ``Container``.
     Volume/cbm: p/unit → Rate cost × CBM (after ``Rounding_rule`` for CBM when present).
     Cost/CBS, Cost/CON, …: p/unit → Rate cost × UNITS_MEASUREMENT segment for that ``Cost/…`` token.
@@ -1803,7 +1846,11 @@ def format_rate_cost_comment(
     if _rate_by_uses_weight_tier_column(rb):
         w = _weight_for_weight_rate_by(rb, row)
         w_s = _format_number_for_rate_comment(w) if w is not None else ""
-        w_label = "WEIGHT_ETOF" if _rate_by_is_weight_kg_etof(rb) else "chargeable weight"
+        w_label = (
+            _weight_source_label_for_weight_kg(row)
+            if _rate_by_is_weight_kg_etof(rb)
+            else "chargeable weight"
+        )
         if _measurement_is_flat(cost_tier_measurement):
             if w is None:
                 return (
