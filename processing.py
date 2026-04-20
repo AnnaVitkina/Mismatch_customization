@@ -53,6 +53,7 @@ COL_RATE_COST_COMMENT = "Rate_cost_comment"
 COL_RATE_COST_FILE = "Rate_cost_file"
 COL_CARRIER_RATE_FILE = "Carrier_rate_file"
 COL_POSSIBLE_RATE_CARD_VALUE_USED = "Possible rate card value used"
+COL_ANOTHER_RATE_LANE_VS_SHIPMENT_SHORT = "Another rate lane vs shipment"
 COL_POSSIBLE_CARRIER_EXCHANGE_RATE = "Possible carrier exchange rate"
 COL_POSSIBLE_CARRIER_USED_UNITS = "Possible_Carrier_used_Units"
 COL_POSSIBLE_CARRIER_USED_UNITS_COMMENT = "Possible_Carrier_used_Units_comment"
@@ -1468,33 +1469,62 @@ def _match_cost_tiers_body_for_target_price(
     return _format_tier_match_entries_transport_detail(details)
 
 
+def _equipment_tier_vs_cont_load_reason_for_lane(
+    row: dict[str, Any],
+    filtered: dict[str, Any],
+    amount: Optional[float],
+    cost_type: Optional[str],
+    lane_num: str,
+) -> str:
+    """
+    One-line reason when same-price tier line(s) on this lane include Reefer cost names
+    but ``CONT_LOAD`` on the shipment is not Reefer — used for ``Another rate lane vs
+    shipment`` when ``compare_shipment_to_lane`` has no scalar field diffs on the lane row.
+    """
+    details = _tier_detail_entries_for_target_price(amount, filtered, cost_type)
+    ln = str(lane_num).strip()
+    on_lane = [e for e in details if str(e.get("lane") or "").strip() == ln]
+    if not on_lane:
+        return ""
+    names = " ".join(_norm(e.get("line_name") or "") for e in on_lane)
+    if "reefer" not in names.lower():
+        return ""
+    cont = _norm(str(row.get("CONT_LOAD") or ""))
+    if not cont or "reefer" in cont.lower():
+        return ""
+    return (
+        f"shipment CONT_LOAD is {cont} (different equipment types); same-price tier line(s) "
+        f"on this lane include Reefer equipment, not matching shipment."
+    )
+
+
 def primary_rate_card_alternate_lane_tier_strings(
     amount: Optional[float],
     filtered: Optional[dict[str, Any]],
     cost_type: Optional[str],
     best_lane_str: str,
     agreement_ra: Optional[str],
+    row: Optional[dict[str, Any]] = None,
 ) -> str:
     """
-    Same agreement RA: lanes whose tier price matches ``amount`` but whose lane id differs
-    from the first ``best_lane(s)`` id. Used when there is no secondary rate card file but
-    another lane (e.g. different Equipment Type) carries the same tier price.
+    Same agreement RA: every tier line whose ``Price`` matches ``amount`` (same cost type),
+    **including** ``best_lane(s)`` and other lanes — so e.g. lane 64 and lane 119 both
+    appear when they share the same tier price. Used when there is no secondary rate card
+    file (else :func:`another_rate_card_lane_match_for_amount` wins).
 
-    Uses the same detailed strings as :func:`_match_cost_tiers_body_for_target_price` (cost name,
-    ``Container/…``, validity) — not only ``Lane #`` + empty weight bracket.
+    Equipment vs ``CONT_LOAD`` is explained in :func:`price_matched_alternate_lanes_vs_shipment_note`,
+    not duplicated here.
+
+    ``best_lane_str`` is retained for API compatibility; tier rows are no longer filtered
+    by lane id. ``row`` is unused (kept for call-site compatibility).
     """
+    _ = (best_lane_str, row)
     if not isinstance(filtered, dict):
         return ""
-    best_ln = (_first_lane_number(best_lane_str) or "").strip()
     details = _tier_detail_entries_for_target_price(amount, filtered, cost_type)
-    alt = [
-        e
-        for e in details
-        if str(e.get("lane") or "").strip() and str(e.get("lane")).strip() != best_ln
-    ]
-    if not alt:
+    if not details:
         return ""
-    body = _format_tier_match_entries_transport_detail(alt)
+    body = _format_tier_match_entries_transport_detail(details)
     return _prefix_rate_agreement_id(body, agreement_ra)
 
 
@@ -1508,31 +1538,43 @@ def price_matched_alternate_lanes_vs_shipment_note(
     etof_mappings: dict[str, str],
 ) -> str:
     """
-    For lanes on the **primary** RA that match ``amount`` but are not the chosen best lane,
-    run ``compare_shipment_to_lane`` so Equipment Type vs ``CONT_LOAD`` (via ``etof_mappings``)
-    and other differences appear under ``Another rate card lane vs shipment``.
+    For every lane on the **primary** RA whose tier ``Price`` matches ``amount`` (same cost
+    type), compare the lane to the shipment. Includes **best_lane(s)** as well as other
+    lanes with the same tier price, so when both e.g. 64 and 119 carry 6479 the note covers
+    both; the best lane gets an explicit line when there are no field differences (previously
+    only non-best alternate lanes were listed).
     """
     if not etof_mappings:
         return ""
-    best_ln = _first_lane_number(best_lane_str) or ""
+    best_ln = (_first_lane_number(best_lane_str) or "").strip()
     pairs = _tiers_matching_target_price(amount, filtered, cost_type)
-    alt_lanes: list[str] = []
-    seen: set[str] = set()
+    seen_lanes: set[str] = set()
+    all_lanes: list[str] = []
     for ln, _wb in pairs:
         k = str(ln).strip()
-        if not k or k == best_ln or k in seen:
+        if not k or k in seen_lanes:
             continue
-        seen.add(k)
-        alt_lanes.append(k)
-    if not alt_lanes:
+        seen_lanes.add(k)
+        all_lanes.append(k)
+    if len(all_lanes) < 2:
         return ""
+    # Best lane first, then numeric lane order
+    def _lane_sort_key(x: str) -> tuple[int, str]:
+        if x == best_ln:
+            return (0, x)
+        try:
+            return (1, f"{int(x):012d}")
+        except ValueError:
+            return (1, x)
+
+    all_lanes.sort(key=_lane_sort_key)
     rate_card_data = filtered.get("rate_card_data") or []
     conditions_list = filtered.get("conditions") or []
     business_rules_list = filtered.get("business_rules") or []
     ship_view = shipment_view_for_rate_card_compare(row, etof_mappings)
     ship_date_str = _normalize_ship_date_for_matching(row)
     lines: list[str] = []
-    for lane_num in alt_lanes:
+    for lane_num in all_lanes:
         lane = _find_lane(rate_card_data, str(lane_num).strip())
         if not lane:
             continue
@@ -1544,22 +1586,65 @@ def price_matched_alternate_lanes_vs_shipment_note(
         if ship_date_str and not _lane_valid_for_shipment_date(lane, ship_date_str):
             msgs.append("shipment date is outside Valid from–Valid to")
         if not msgs:
+            if str(lane_num).strip() == best_ln:
+                equip = _equipment_tier_vs_cont_load_reason_for_lane(
+                    row, filtered, amount, cost_type, str(lane_num)
+                )
+                if equip:
+                    lines.append(f"Lane {lane_num}: {equip}")
+                else:
+                    lines.append(
+                        f"Lane {lane_num} (best match): same tier price; no field differences "
+                        "vs shipment on compared lane columns."
+                    )
             continue
-        et_msgs = [m for m in msgs if m.startswith("Equipment Type:")]
-        rest = [m for m in msgs if not m.startswith("Equipment Type:")]
-        if et_msgs:
-            inner = et_msgs[0].replace("Equipment Type:", "", 1).strip()
-            core = (
-                f"Cost is provided for Equipment Type: {inner} (lane {lane_num})"
-            )
-        else:
-            core = f"Cost is provided for same-tier lane {lane_num}: " + "; ".join(
-                msgs
-            )
-        if rest:
-            core += "; " + "; ".join(rest)
-        lines.append(core)
+        ordered = _sort_lane_vs_shipment_messages_by_priority(msgs)
+        lines.append(f"Lane {lane_num}: " + "; ".join(ordered))
     return "\n".join(lines)
+
+
+def summarize_another_rc_lane_vs_shipment_notes(
+    note_transport: str,
+    note_amount_lanes: str,
+    note_price_alt: str,
+    note_other: str,
+    max_len: int = 280,
+) -> str:
+    """
+    Short summary from the same four sources as
+    :data:`COL_ANOTHER_RC_LANE_VS_SHIPMENT`. Uses the first non-empty block; when that
+    block has several lines (e.g. best lane + alternate lane), joins up to two lines with
+    `` | ``. Truncates long lines at the first ``;`` when over 120 chars.
+    """
+
+    def _compress_line(line: str, per_line_cap: int) -> str:
+        line = line.strip()
+        if ";" in line and len(line) > 120:
+            head = line.split(";", 1)[0].strip()
+            if len(head) >= 40:
+                line = head + (" …" if len(line) > len(head) + 1 else "")
+        if len(line) > per_line_cap:
+            line = line[: per_line_cap - 1].rstrip() + "…"
+        return line
+
+    for raw in (note_transport, note_amount_lanes, note_price_alt, note_other):
+        if not raw or not str(raw).strip():
+            continue
+        block_lines = [ln.strip() for ln in str(raw).split("\n") if ln.strip()]
+        if not block_lines:
+            continue
+        # Prefer equipment / CONT_LOAD reason lines (e.g. lane 119 Reefer tiers vs FCL/40HV)
+        pref = [ln for ln in block_lines if "CONT_LOAD" in ln or "different equipment" in ln.lower()]
+        rest = [ln for ln in block_lines if ln not in pref]
+        block_lines = pref + rest
+        n_take = min(2, len(block_lines))
+        cap = max(120, max_len // n_take)
+        parts = [_compress_line(block_lines[i], cap) for i in range(n_take)]
+        out = " | ".join(parts)
+        if len(out) > max_len:
+            out = out[: max_len - 1].rstrip() + "…"
+        return out
+    return ""
 
 
 def _prefix_rate_agreement_id(body: str, rate_agreement_id: Optional[str]) -> str:
@@ -2410,6 +2495,43 @@ def _display_val(v: Any) -> str:
     return s if s else "n/a"
 
 
+def _shipment_origin_city_label(ship_view: dict[str, Any]) -> str:
+    """Shipment origin city for compact lane notes when ``Origin City`` is unmapped."""
+    for k in ("Origin City", "SHIP_CITY_ETOF", "SHIP_CITY_ISD", "SHIP_CITY"):
+        v = ship_view.get(k)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        s = str(v).strip()
+        if s and s.lower() not in ("nan", "none"):
+            return _display_val(v)
+    return "n/a"
+
+
+def _shipment_container_type_label(ship_view: dict[str, Any]) -> str:
+    """Shipment container / load type (``CONT_LOAD``) for compact lane notes."""
+    for k in ("CONT_LOAD", "Equipment Type"):
+        v = ship_view.get(k)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        s = str(v).strip()
+        if s and s.lower() not in ("nan", "none"):
+            return _display_val(v)
+    return "n/a"
+
+
+def _sort_lane_vs_shipment_messages_by_priority(msgs: list[str]) -> list[str]:
+    """Prefer container/equipment mismatch, then origin city, then other columns."""
+
+    def _key(m: str) -> tuple[int, str]:
+        if m.startswith("Different Container Type"):
+            return (0, m)
+        if m.startswith("Different Origin city"):
+            return (1, m)
+        return (2, m)
+
+    return sorted(msgs, key=_key)
+
+
 def _lane_scalar_value_columns(lane: dict[str, Any]) -> list[str]:
     """Same as matching's lane value columns, but skip validity dates, ``Costs``, and nested values."""
     out: list[str] = []
@@ -2487,6 +2609,12 @@ def _format_lane_vs_shipment_messages(
                 "destination postal code differs (lane "
                 f"{_display_val(lane.get('Destination Postal Code'))} vs shipment {_display_val(ship_view.get('Destination Postal Code'))})"
             )
+        elif col == "Origin City":
+            city = _shipment_origin_city_label(ship_view)
+            msgs.append(f"Different Origin city ({city})")
+        elif col == "Equipment Type":
+            ct = _shipment_container_type_label(ship_view)
+            msgs.append(f"Different Container Type ({ct})")
         else:
             lv = _display_val(lane.get(col))
             sv = _display_val(ship_view.get(col))
@@ -3314,7 +3442,12 @@ def enrich_mismatch_rows(
         )
         if not (s_another_crf or "").strip():
             s_another_crf = primary_rate_card_alternate_lane_tier_strings(
-                crf, filtered if isinstance(filtered, dict) else None, cost_type, best_lane, ra_id
+                crf,
+                filtered if isinstance(filtered, dict) else None,
+                cost_type,
+                best_lane,
+                ra_id,
+                row,
             )
         inv_stmt = _invoice_statement_cost_inv_curr(row)
         s_another_inv = another_rate_card_lane_match_for_amount(
@@ -3322,7 +3455,12 @@ def enrich_mismatch_rows(
         )
         if not (s_another_inv or "").strip():
             s_another_inv = primary_rate_card_alternate_lane_tier_strings(
-                inv_stmt, filtered if isinstance(filtered, dict) else None, cost_type, best_lane, ra_id
+                inv_stmt,
+                filtered if isinstance(filtered, dict) else None,
+                cost_type,
+                best_lane,
+                ra_id,
+                row,
             )
         new_row[COL_ANOTHER_RATE_CARD_CARRIER_USED_CRF] = s_another_crf
         new_row[COL_ANOTHER_RATE_CARD_CARRIER_USED_INV] = s_another_inv
@@ -3370,6 +3508,11 @@ def enrich_mismatch_rows(
                 )
         new_row[COL_ANOTHER_RC_LANE_VS_SHIPMENT] = "\n".join(
             x for x in (note_transport, note_amount_lanes, note_price_alt, note_other) if x
+        )
+        new_row[COL_ANOTHER_RATE_LANE_VS_SHIPMENT_SHORT] = (
+            summarize_another_rc_lane_vs_shipment_notes(
+                note_transport, note_amount_lanes, note_price_alt, note_other
+            )
         )
         enriched.append(new_row)
     return enriched
