@@ -28,6 +28,7 @@ from matching import (
     VALIDITY_DATE_COLUMNS,
     _get_lane_value_columns,
     _lane_valid_for_shipment_date,
+    _normalize_for_compare,
     _parse_date_for_validity,
     compare_shipment_to_lane,
 )
@@ -60,6 +61,7 @@ COL_POSSIBLE_CARRIER_USED_UNITS_COMMENT = "Possible_Carrier_used_Units_comment"
 COL_ANOTHER_RATE_CARD_CARRIER_USED_CRF = "Another_rate_card_Carrier_used(Carrier_rate_file)"
 COL_ANOTHER_RATE_CARD_CARRIER_USED_INV = "Another_rate_card_Carrier_used(Inv cost)"
 COL_BEST_MATCH_ANOTHER_RATE_CARD = "Best match from another rate card"
+COL_BEST_MATCH_ANOTHER_RATE_LANE = "Best match from another rate lane"
 COL_ANOTHER_RC_LANE_VS_SHIPMENT = "Another rate card lane vs shipment"
 
 MSG_NO_LANE_SAME_COST = "No lane with the same cost found"
@@ -566,10 +568,13 @@ def _grouped_transport_def_valid_for_ship_date(
 
 
 def _lane_cost_line_valid_for_ship_date(cost: dict[str, Any], row: dict[str, Any]) -> bool:
-    """Lane ``Costs`` row ``Validity from`` / ``Validity to`` contains shipment date when present."""
+    """Lane ``Costs`` row: ``Validity from``/``to`` and/or ``Validity period`` vs ``SHIP_DATE``."""
     vf = cost.get("Validity from") or cost.get("Validity From")
     vt = cost.get("Validity to") or cost.get("Validity To")
     if vf is None and vt is None:
+        vp = cost.get("Validity period")
+        if vp and str(vp).strip():
+            return _text_validity_period_contains_shipment_date(str(vp), row)
         return True
     ship = _row_ship_date_as_date(row)
     if ship is None:
@@ -1528,6 +1533,274 @@ def primary_rate_card_alternate_lane_tier_strings(
     return _prefix_rate_agreement_id(body, agreement_ra)
 
 
+def _price_matched_lane_message_build(
+    row: dict[str, Any],
+    filtered: dict[str, Any],
+    amount: Optional[float],
+    cost_type: Optional[str],
+    lane_num: str,
+    etof_mappings: dict[str, str],
+) -> Optional[tuple[list[str], list[dict[str, str]]]]:
+    """
+    Per-lane message list for the same **Carrier rate file** tier price (primary RA), before
+    the "Matched tier price row(s)" line and before :func:`price_matched_alternate_lanes_vs_shipment_note` joining.
+    """
+    if not etof_mappings:
+        return None
+    rate_card_data = filtered.get("rate_card_data") or []
+    conditions_list = filtered.get("conditions") or []
+    business_rules_list = filtered.get("business_rules") or []
+    ship_view = shipment_view_for_rate_card_compare(row, etof_mappings)
+    ship_date_str = _normalize_ship_date_for_matching(row)
+    lane = _find_lane(rate_card_data, str(lane_num).strip())
+    if not lane:
+        return None
+    value_columns = _lane_scalar_value_columns(lane)
+    _dc, diffs = compare_shipment_to_lane(
+        ship_view, lane, conditions_list, business_rules_list, value_columns
+    )
+    msgs = _format_lane_vs_shipment_messages(lane, ship_view, diffs)
+    for s in _supplemental_tier_price_lane_vs_shipment_messages(
+        lane, ship_view, msgs
+    ):
+        msgs.append(s)
+    if ship_date_str and not _lane_valid_for_shipment_date(lane, ship_date_str):
+        msgs.append(
+            _shipment_outside_lane_validity_message(lane, ship_date_str)
+        )
+    tier_entries = [
+        e
+        for e in _tier_detail_entries_for_target_price(amount, filtered, cost_type)
+        if str(e.get("lane") or "").strip() == str(lane_num).strip()
+    ]
+    seen_val_msgs: set[str] = set()
+    seen_cdef_name: set[str] = set()
+    ct = str(cost_type) if cost_type is not None else ""
+    for e in tier_entries:
+        line_name = str(e.get("line_name") or "")
+        vcompact = (e.get("validity") or "").strip()
+        c_row = _find_lane_cost_row_for_tier_entry(
+            lane, amount, line_name, vcompact, ct
+        )
+        if c_row and not _lane_cost_line_valid_for_ship_date(c_row, row):
+            em = _lane_cost_row_outside_validity_message(c_row, row)
+            if em and em not in seen_val_msgs:
+                seen_val_msgs.add(em)
+                msgs.append(em)
+            continue
+        nk = _norm(line_name)
+        if not nk or nk in seen_cdef_name:
+            continue
+        cdef_msg = _cost_definition_validity_outside_message(
+            filtered, line_name, row
+        )
+        if cdef_msg and cdef_msg not in seen_val_msgs:
+            seen_val_msgs.add(cdef_msg)
+            msgs.append(cdef_msg)
+            seen_cdef_name.add(nk)
+    return (msgs, tier_entries)
+
+
+def _is_lane_validity_mismatch_line(m: str) -> bool:
+    t = m.strip()
+    if not t.startswith("shipment date"):
+        return False
+    lo = t.lower()
+    if "is outside" in lo:
+        return True
+    if "outside the" in lo:
+        return True
+    return False
+
+
+def _is_lane_service_mismatch_line(m: str) -> bool:
+    t = m.strip()
+    if t.startswith("Service:"):
+        return True
+    if "another service" in t.lower():
+        return True
+    return False
+
+
+def _is_lane_invoice_type_mismatch_line(m: str) -> bool:
+    return m.strip().lower().startswith("invoice type")
+
+
+def _is_lane_carrier_name_mismatch_line(m: str) -> bool:
+    return m.strip().lower().startswith("carrier name")
+
+
+def _other_lane_mismatch_line_short(m: str, max_len: int = 90) -> str:
+    """
+    Compact display for a lane–shipment line that is not one of the standard validity /
+    service / invoice / carrier buckets (shown in full up to max_len).
+    """
+    t = re.sub(r"\s+", " ", m.strip())
+    if len(t) > max_len:
+        return t[: max_len - 1].rstrip() + "…"
+    return t
+
+
+def _best_match_another_rate_lane_label_parts(msgs: list[str]) -> list[str]:
+    """
+    Human-readable list of what would need to change to align the shipment with this lane’s
+    tier price row(s), in the same spirit as the lane-vs-shipment note (short labels + any
+    extra field lines, truncated).
+    """
+    if not msgs:
+        return ["no field differences in scope (same tier price)"]
+    work = [m for m in msgs if not m.startswith("Matched tier price row(s):")]
+    if not work:
+        return ["no field differences in scope (same tier price)"]
+    parts: list[str] = []
+    if any(_is_lane_validity_mismatch_line(m) for m in work):
+        parts.append("validity (shipment date vs cost/lane validities)")
+    if any(_is_lane_service_mismatch_line(m) for m in work):
+        parts.append("service")
+    if any(_is_lane_invoice_type_mismatch_line(m) for m in work):
+        parts.append("invoice type")
+    if any(_is_lane_carrier_name_mismatch_line(m) for m in work):
+        parts.append("carrier name")
+    for m in work:
+        if _is_lane_validity_mismatch_line(m):
+            continue
+        if _is_lane_service_mismatch_line(m):
+            continue
+        if _is_lane_invoice_type_mismatch_line(m):
+            continue
+        if _is_lane_carrier_name_mismatch_line(m):
+            continue
+        parts.append(_other_lane_mismatch_line_short(m))
+    return parts
+
+
+def _format_best_match_another_rate_lane_line(lane_id: str, msgs: list[str]) -> str:
+    label_parts = _best_match_another_rate_lane_label_parts(msgs)
+    if len(label_parts) == 1 and label_parts[0].startswith("no field differences"):
+        return f"Lane {lane_id} — {label_parts[0]}"
+    return f"Lane {lane_id} — changes: " + " + ".join(label_parts)
+
+
+def _price_matched_lane_mismatch_sort_key(msgs: list[str]) -> tuple[int, int]:
+    """
+    Sort key for "least change" selection among lanes with the same tier price. Lower is better.
+
+    **Primary**: prefer no **Service** mismatch (``(0, *)`` before ``(1, *)``).
+    **Secondary**: minimize the count of **change dimensions** — validity, service, invoice
+    type, carrier name, and any other compared-field lines (one each).
+    """
+    if not msgs:
+        return (0, 0)
+    work = [m for m in msgs if not m.startswith("Matched tier price row(s):")]
+    if not work:
+        return (0, 0)
+    v = 1 if any(_is_lane_validity_mismatch_line(m) for m in work) else 0
+    svc = 1 if any(_is_lane_service_mismatch_line(m) for m in work) else 0
+    inv = 1 if any(_is_lane_invoice_type_mismatch_line(m) for m in work) else 0
+    carr = 1 if any(_is_lane_carrier_name_mismatch_line(m) for m in work) else 0
+    other = 0
+    for m in work:
+        if _is_lane_validity_mismatch_line(m):
+            continue
+        if _is_lane_service_mismatch_line(m):
+            continue
+        if _is_lane_invoice_type_mismatch_line(m):
+            continue
+        if _is_lane_carrier_name_mismatch_line(m):
+            continue
+        other += 1
+    total = v + svc + inv + carr + other
+    return (svc, total)
+
+
+def _lane_id_numeric_sort_key(lane_s: str) -> tuple:
+    s = str(lane_s).strip()
+    if s.isdigit():
+        return (0, int(s))
+    return (1, s)
+
+
+def best_match_from_another_rate_lane(
+    row: dict[str, Any],
+    filtered: dict[str, Any],
+    agreement_ra: Optional[str],
+    amount: Optional[float],
+    cost_type: Optional[str],
+    best_lane_str: str,
+    etof_mappings: dict[str, str],
+) -> str:
+    """
+    Among all primary-RA lanes whose tier ``Price`` matches ``amount`` (same cost type) —
+    the same set as in :func:`price_matched_alternate_lanes_vs_shipment_note` — pick
+    lane id(s) that need the **least work** to align the shipment: prefer **no Service**
+    mismatch, then the smallest number of other mismatch dimensions (validity, invoice type,
+    carrier name, other column diffs).     Ties: all tied lanes, separated by `` | ``, with a short **changes** comment each.
+    ``agreement_ra`` is reserved for a future prefix; rates are the same primary RA.
+    """
+    _ = agreement_ra
+    if not etof_mappings or not isinstance(filtered, dict):
+        return ""
+    if amount is None:
+        return ""
+    best_ln = (_first_lane_number(best_lane_str) or "").strip()
+    pairs = _tiers_matching_target_price(amount, filtered, cost_type)
+    seen_lanes: set[str] = set()
+    all_lanes: list[str] = []
+    for ln, _wb in pairs:
+        k = str(ln).strip()
+        if not k or k in seen_lanes:
+            continue
+        seen_lanes.add(k)
+        all_lanes.append(k)
+    if not all_lanes:
+        return ""
+
+    def _lane_sort_key(x: str) -> tuple[int, str]:
+        if x == best_ln:
+            return (0, x)
+        try:
+            return (1, f"{int(x):012d}")
+        except ValueError:
+            return (1, x)
+
+    all_lanes.sort(key=_lane_sort_key)
+    scored: list[tuple[tuple[int, int], str]] = []
+    lane_to_msgs: dict[str, list[str]] = {}
+    for lane_num in all_lanes:
+        built = _price_matched_lane_message_build(
+            row, filtered, amount, cost_type, str(lane_num), etof_mappings
+        )
+        if built is None:
+            continue
+        msgs, tier_entries = built
+        ln_key = str(lane_num).strip()
+        if not msgs:
+            if str(lane_num).strip() == best_ln:
+                eq = _equipment_tier_vs_cont_load_reason_for_lane(
+                    row, filtered, amount, cost_type, str(lane_num)
+                )
+                if eq:
+                    sk = _price_matched_lane_mismatch_sort_key([eq])
+                    lane_to_msgs[ln_key] = [eq]
+                else:
+                    sk = (0, 0)
+                    lane_to_msgs[ln_key] = []
+                scored.append((sk, ln_key))
+            continue
+        sk = _price_matched_lane_mismatch_sort_key(msgs)
+        scored.append((sk, ln_key))
+        lane_to_msgs[ln_key] = msgs
+    if not scored:
+        return ""
+    min_key = min(sk for sk, _ in scored)
+    winners = [ln for sk, ln in scored if sk == min_key]
+    winners.sort(key=_lane_id_numeric_sort_key)
+    return " | ".join(
+        _format_best_match_another_rate_lane_line(ln, lane_to_msgs.get(ln, []))
+        for ln in winners
+    )
+
+
 def price_matched_alternate_lanes_vs_shipment_note(
     row: dict[str, Any],
     filtered: dict[str, Any],
@@ -1539,10 +1812,13 @@ def price_matched_alternate_lanes_vs_shipment_note(
 ) -> str:
     """
     For every lane on the **primary** RA whose tier ``Price`` matches ``amount`` (same cost
-    type), compare the lane to the shipment. Includes **best_lane(s)** as well as other
-    lanes with the same tier price, so when both e.g. 64 and 119 carry 6479 the note covers
-    both; the best lane gets an explicit line when there are no field differences (previously
-    only non-best alternate lanes were listed).
+    type), compare the lane to the shipment. Includes **all** such lanes, including when
+    only **one** lane (e.g. 108) matches the Carrier_rate_file — previously required two
+    lanes, which left these columns empty.
+
+    When conditional rules cause ``Service`` to be omitted from ``compare_shipment_to_lane``
+    diffs, a **supplemental** ``Service: lane … vs shipment …`` line is still added. Validity
+    failures include the lane’s Valid from / Valid to in the message.
     """
     if not etof_mappings:
         return ""
@@ -1556,7 +1832,7 @@ def price_matched_alternate_lanes_vs_shipment_note(
             continue
         seen_lanes.add(k)
         all_lanes.append(k)
-    if len(all_lanes) < 2:
+    if not all_lanes:
         return ""
     # Best lane first, then numeric lane order
     def _lane_sort_key(x: str) -> tuple[int, str]:
@@ -1568,23 +1844,29 @@ def price_matched_alternate_lanes_vs_shipment_note(
             return (1, x)
 
     all_lanes.sort(key=_lane_sort_key)
-    rate_card_data = filtered.get("rate_card_data") or []
-    conditions_list = filtered.get("conditions") or []
-    business_rules_list = filtered.get("business_rules") or []
-    ship_view = shipment_view_for_rate_card_compare(row, etof_mappings)
-    ship_date_str = _normalize_ship_date_for_matching(row)
     lines: list[str] = []
     for lane_num in all_lanes:
-        lane = _find_lane(rate_card_data, str(lane_num).strip())
-        if not lane:
-            continue
-        value_columns = _lane_scalar_value_columns(lane)
-        _dc, diffs = compare_shipment_to_lane(
-            ship_view, lane, conditions_list, business_rules_list, value_columns
+        built = _price_matched_lane_message_build(
+            row, filtered, amount, cost_type, str(lane_num), etof_mappings
         )
-        msgs = _format_lane_vs_shipment_messages(lane, ship_view, diffs)
-        if ship_date_str and not _lane_valid_for_shipment_date(lane, ship_date_str):
-            msgs.append("shipment date is outside Valid from–Valid to")
+        if built is None:
+            continue
+        msgs, tier_entries = built
+        if tier_entries:
+            td = _format_tier_match_entries_transport_detail(
+                [
+                    {
+                        "lane": (e.get("lane") or "").strip(),
+                        "line_name": (e.get("line_name") or "").strip(),
+                        "rate_by_token": (e.get("rate_by_token") or "").strip(),
+                        "wb": (e.get("wb") or "").strip(),
+                        "validity": (e.get("validity") or "").strip(),
+                    }
+                    for e in tier_entries
+                ]
+            )
+            if td:
+                msgs.append("Matched tier price row(s): " + td)
         if not msgs:
             if str(lane_num).strip() == best_ln:
                 equip = _equipment_tier_vs_cont_load_reason_for_lane(
@@ -1633,8 +1915,16 @@ def summarize_another_rc_lane_vs_shipment_notes(
         block_lines = [ln.strip() for ln in str(raw).split("\n") if ln.strip()]
         if not block_lines:
             continue
-        # Prefer equipment / CONT_LOAD reason lines (e.g. lane 119 Reefer tiers vs FCL/40HV)
-        pref = [ln for ln in block_lines if "CONT_LOAD" in ln or "different equipment" in ln.lower()]
+        # Prefer matched tier references, then lane cost / cost-def validity, then equipment
+        pref = [
+            ln
+            for ln in block_lines
+            if "Matched tier price row" in ln
+            or "lane cost row" in ln
+            or "cost definition" in ln
+            or "CONT_LOAD" in ln
+            or "different equipment" in ln.lower()
+        ]
         rest = [ln for ln in block_lines if ln not in pref]
         block_lines = pref + rest
         n_take = min(2, len(block_lines))
@@ -2519,15 +2809,189 @@ def _shipment_container_type_label(ship_view: dict[str, Any]) -> str:
     return "n/a"
 
 
+def _supplemental_tier_price_lane_vs_shipment_messages(
+    lane: dict[str, Any],
+    ship_view: dict[str, Any],
+    existing_msgs: list[str],
+) -> list[str]:
+    """
+    ``compare_shipment_to_lane`` may omit *Service* when a conditional rule passes while
+    lane Service still differs from the shipment — surface a plain ``Service: lane …`` line
+    for same-price tier notes.
+    """
+    if any("Service" in m and "lane " in m and "shipment" in m for m in existing_msgs):
+        return []
+    rc_val = lane.get("Service") or lane.get("Service Type")
+    if _normalize_for_compare(rc_val) is None:
+        return []
+    ship_v = (
+        ship_view.get("Service")
+        or ship_view.get("Service Type")
+        or ship_view.get("SERVICE")
+        or ship_view.get("SERVICE_ETOF")
+        or ship_view.get("SERVICE_ISD")
+    )
+    if _normalize_for_compare(ship_v) is None:
+        return []
+    if _norm(str(rc_val)) == _norm(str(ship_v)):
+        return []
+    lv = _display_val(rc_val)
+    sv = _display_val(ship_v)
+    return [f"Service: lane {lv} vs shipment {sv}"]
+
+
+def _shipment_outside_lane_validity_message(
+    lane: dict[str, Any], ship_date_str: str
+) -> str:
+    """When SHIP_DATE is outside the lane’s Valid from / Valid to, include those dates."""
+    vf = _display_val(lane.get("Valid from"))
+    vt = _display_val(lane.get("Valid to"))
+    r = f"shipment date {ship_date_str} is outside the Valid from / Valid to window for this lane"
+    if vf != "n/a" or vt != "n/a":
+        r += f" ({vf} – {vt})"
+    return r
+
+
+def _cost_definition_validity_outside_message(
+    filtered: dict[str, Any],
+    line_name: str,
+    row: dict[str, Any],
+) -> str:
+    """
+    If ``cost_definitions`` for this tier ``Cost_type``/line name has a ``Validity period``
+    in ``Applies_if`` and :func:`_text_validity_period_contains_shipment_date` is False,
+    return one line naming the cost and the period (e.g. Round 5 tier ended 30.08.2025 but
+    SHIP_DATE is 2026-03-28). Lane ``Valid to`` is separate; both can apply.
+    """
+    if not line_name or not str(line_name).strip():
+        return ""
+    defs = filtered.get("cost_definitions") or []
+    ct_key = _norm(str(line_name))
+    defn: Optional[dict[str, Any]] = None
+    for d in defs:
+        if not isinstance(d, dict):
+            continue
+        if _norm(str(d.get("Cost_type") or "")) == ct_key:
+            defn = d
+            break
+    if defn is None:
+        for d in defs:
+            if not isinstance(d, dict):
+                continue
+            if _cost_type_matches_row_to_card(ct_key, d.get("Cost_type")):
+                defn = d
+                break
+    if defn is None:
+        return ""
+    ai = defn.get("Applies_if") or ""
+    if not str(ai).strip():
+        return ""
+    if _text_validity_period_contains_shipment_date(str(ai), row):
+        return ""
+    ship_disp = _normalize_ship_date_for_matching(row) or ""
+    blob = str(ai).replace("\r\n", "\n")
+    mrng = re.search(
+        r"(?i)validity\s+period\s*:\s*from\s*(\d{1,2}\.\d{1,2}\.\d{4})\s*to\s*(\d{1,2}\.\d{1,2}\.\d{4})",
+        blob,
+    )
+    range_s = ""
+    if mrng:
+        range_s = f"from {mrng.group(1)} to {mrng.group(2)}"
+    display_name = str(line_name).strip()
+    if len(display_name) > 100:
+        display_name = display_name[:97] + "…"
+    out = (
+        f"shipment date {ship_disp} is outside the cost definition Validity period for "
+        f'"{display_name}"'
+    )
+    if range_s:
+        out += f" ({range_s})"
+    return out
+
+
+def _find_lane_cost_row_for_tier_entry(
+    lane: dict[str, Any],
+    amount: Optional[float],
+    line_name: str,
+    validity_compact: str,
+    row_cost_type: str,
+) -> Optional[dict[str, Any]]:
+    """
+    The ``Costs`` row on ``lane`` that matches the tier (Cost Type, price, same validity
+    window as in :func:`_tier_detail_entries_for_target_price` dedup key).
+    """
+    if amount is None or not line_name:
+        return None
+    try:
+        target = round(float(amount) + 1e-8, 2)
+    except (TypeError, ValueError):
+        return None
+    ct = _norm(str(row_cost_type))
+    wanted_line = _norm(str(line_name))
+    want_v = (validity_compact or "").strip()
+    for c in lane.get("Costs") or []:
+        if not isinstance(c, dict):
+            continue
+        if not _cost_type_matches_row_to_card(ct, c.get("Cost Type")):
+            continue
+        if _norm(str(c.get("Cost Type") or "")) != wanted_line:
+            continue
+        p = c.get("Price")
+        if p is None:
+            continue
+        try:
+            pf = float(p)
+        except (TypeError, ValueError):
+            continue
+        if round(pf, 2) != target:
+            continue
+        got_v = _lane_cost_validity_compact(c) or ""
+        if got_v == want_v or (not want_v and not got_v):
+            return c
+    return None
+
+
+def _lane_cost_row_outside_validity_message(
+    cost: dict[str, Any], row: dict[str, Any]
+) -> str:
+    """User-facing line when SHIP_DATE is outside this lane ``Costs`` row’s validity window."""
+    if _lane_cost_line_valid_for_ship_date(cost, row):
+        return ""
+    ship_disp = _normalize_ship_date_for_matching(row) or ""
+    cname = str(cost.get("Cost Type") or "").strip()
+    if len(cname) > 120:
+        cname = cname[:117] + "…"
+    r = f'shipment date {ship_disp} is outside the lane cost row Validity for "{cname}"'
+    vf = _display_val(cost.get("Validity from") or cost.get("Validity From"))
+    vt = _display_val(cost.get("Validity to") or cost.get("Validity To"))
+    if vf != "n/a" and vt != "n/a":
+        r += f" (from {vf} to {vt})"
+    else:
+        vp = _norm(cost.get("Validity period") or "")
+        if vp:
+            r += f" ({vp})"
+    return r
+
+
 def _sort_lane_vs_shipment_messages_by_priority(msgs: list[str]) -> list[str]:
-    """Prefer container/equipment mismatch, then origin city, then other columns."""
+    """Prefer lane cost row validity, cost-def, lane table, Service, then the rest."""
 
     def _key(m: str) -> tuple[int, str]:
-        if m.startswith("Different Container Type"):
+        if m.startswith("Matched tier price row(s):"):
+            return (-1, m)
+        if m.startswith("shipment date") and "lane cost row" in m:
             return (0, m)
-        if m.startswith("Different Origin city"):
+        if m.startswith("shipment date") and "cost definition" in m:
             return (1, m)
-        return (2, m)
+        if m.startswith("shipment date"):
+            return (2, m)
+        if m.startswith("Service:"):
+            return (3, m)
+        if m.startswith("Different Container Type"):
+            return (4, m)
+        if m.startswith("Different Origin city"):
+            return (5, m)
+        return (6, m)
 
     return sorted(msgs, key=_key)
 
@@ -2651,10 +3115,19 @@ def rate_card_lanes_vs_shipment_notes(
             ship_view, lane, conditions_list, business_rules_list, value_columns
         )
         msgs = _format_lane_vs_shipment_messages(lane, ship_view, diffs)
+        for s in _supplemental_tier_price_lane_vs_shipment_messages(
+            lane, ship_view, msgs
+        ):
+            msgs.append(s)
         if ship_date_str and not _lane_valid_for_shipment_date(lane, ship_date_str):
-            msgs.append("shipment date is outside Valid from–Valid to")
+            msgs.append(
+                _shipment_outside_lane_validity_message(lane, ship_date_str)
+            )
         if msgs:
-            parts.append(f"Lane {lane_num} ({ra_label}): " + "; ".join(msgs))
+            ordered = _sort_lane_vs_shipment_messages_by_priority(msgs)
+            parts.append(
+                f"Lane {lane_num} ({ra_label}): " + "; ".join(ordered)
+            )
     return "\n".join(parts)
 
 
@@ -3496,6 +3969,7 @@ def enrich_mismatch_rows(
             etof_mappings,
         )
         note_price_alt = ""
+        best_match_another_lane = ""
         if isinstance(filtered, dict) and etof_mappings:
             ref_amt: Optional[float] = None
             if crf is not None:
@@ -3506,6 +3980,10 @@ def enrich_mismatch_rows(
                 note_price_alt = price_matched_alternate_lanes_vs_shipment_note(
                     row, filtered, ra_id, ref_amt, cost_type, best_lane, etof_mappings
                 )
+                best_match_another_lane = best_match_from_another_rate_lane(
+                    row, filtered, ra_id, ref_amt, cost_type, best_lane, etof_mappings
+                )
+        new_row[COL_BEST_MATCH_ANOTHER_RATE_LANE] = best_match_another_lane
         new_row[COL_ANOTHER_RC_LANE_VS_SHIPMENT] = "\n".join(
             x for x in (note_transport, note_amount_lanes, note_price_alt, note_other) if x
         )
